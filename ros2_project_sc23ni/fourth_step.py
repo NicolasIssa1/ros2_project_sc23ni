@@ -14,17 +14,51 @@ from cv_bridge import CvBridge, CvBridgeError
 ESCAPE_TURN_SPEED = -0.8
 ESCAPE_TURN_TIME = 2.1          # right ~95 deg
 
-ESCAPE_FORWARD_SPEED = 0.20
+ESCAPE_FORWARD_SPEED = 0.30
 ESCAPE_FORWARD_TIME = 24      # leave starting compartment
 
 GREEN_TURN_SPEED = 0.8
 GREEN_TURN_TIME = 2.0           # left ~90 deg toward green area
 
-GREEN_FORWARD_SPEED = 0.18
+GREEN_FORWARD_SPEED = 0.28
 GREEN_FORWARD_TIME = 3.2        # move toward green area
 
+# ---------- Green → Red path (tune these on real map!) ----------
+GREEN_REACHED_PAUSE = 1.5           # seconds to pause at green
+LEAVE_GREEN_TURN_SPEED = -0.8       # clockwise to exit green area
+LEAVE_GREEN_TURN_TIME = 3.2         # ~145 deg — adjust per map
+
+PATH_GR_FWD1_SPEED = 0.18
+PATH_GR_FWD1_TIME = 5.0             # forward segment 1 toward red
+
+PATH_GR_TURN_SPEED = -0.8           # turn toward red zone
+PATH_GR_TURN_TIME = 2.0             # ~90 deg — adjust per map
+
+PATH_GR_FWD2_SPEED = 0.18
+PATH_GR_FWD2_TIME = 5.0             # forward segment 2
+
+RED_SEARCH_ROTATE_SPEED = 0.4       # slow rotation to scan for red
+RED_SEARCH_TIMEOUT = 12.0           # seconds before fallback
+RED_REACHED_PAUSE = 1.5             # seconds to pause at red
+
+# ---------- Red → Blue path ----------
+LEAVE_RED_TURN_SPEED = -0.8         # clockwise (right) to swing AWAY from wall
+LEAVE_RED_TURN_TIME = 1.8           # ~80 deg right — clear the wall first
+
+PATH_RB_FWD1_SPEED = 0.25
+PATH_RB_FWD1_TIME = 3.5             # forward to pass the wall
+
+PATH_RB_TURN_SPEED = 0.8            # counter-clockwise (left) toward blue
+PATH_RB_TURN_TIME = 2.8             # ~125 deg left — face blue from clean angle
+
+PATH_RB_FWD2_SPEED = 0.25
+PATH_RB_FWD2_TIME = 4.0             # forward segment 2 toward blue
+
+BLUE_SEARCH_ROTATE_SPEED = 0.4      # slow rotation to scan for blue
+BLUE_SEARCH_TIMEOUT = 12.0          # seconds before fallback
+
 # ---------- General motion ----------
-FORWARD_SPEED = 0.18
+FORWARD_SPEED = 0.25
 TURN_SPEED = 0.9
 SOFT_TURN_SPEED = 0.35
 
@@ -80,6 +114,8 @@ class ColourProject(Node):
         self.state = "escape_turn"
         self.state_start = time.time()
         self.target_reached = False
+        self.green_done = False
+        self.red_done = False
 
         self.get_logger().info("ColourProject node started")
 
@@ -225,9 +261,14 @@ class ColourProject(Node):
             cv2.putText(image, txt, (10, 105),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
 
+        if self.red_visible:
+            txt = "RED clear" if self.red_reachable else "RED blocked"
+            cv2.putText(image, txt, (10, 135),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
+
         if self.blue_visible:
             txt = "BLUE clear" if self.blue_reachable else "BLUE blocked"
-            cv2.putText(image, txt, (10, 135),
+            cv2.putText(image, txt, (10, 165),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 0), 2)
 
         cv2.imshow("camera_feed", image)
@@ -246,8 +287,8 @@ class ColourProject(Node):
             self.stop_robot()
             return
 
-        # Highest priority: reachable blue
-        if self.blue_visible and self.blue_reachable and self.state != "approach_blue":
+        # Highest priority: reachable blue (only after red is done)
+        if self.red_done and self.blue_visible and self.blue_reachable and self.state != "approach_blue":
             self.set_state("approach_blue")
 
         # 1) initial perfect path
@@ -279,10 +320,6 @@ class ColourProject(Node):
 
         # 3) drive toward green area
         if self.state == "go_to_green_zone":
-            if self.blue_visible and self.blue_reachable:
-                self.set_state("approach_blue")
-                return
-
             if self.green_visible and self.green_reachable:
                 self.set_state("approach_green")
                 return
@@ -297,30 +334,208 @@ class ColourProject(Node):
                 self.set_state("explore")
             return
 
-        # 4) optional approach green for demo quality
+        # 4) approach green cube
         if self.state == "approach_green":
-            if self.blue_visible and self.blue_reachable:
-                self.set_state("approach_blue")
-                return
-
             if not (self.green_visible and self.green_reachable):
                 self.set_state("explore")
                 return
 
             if self.front_dist <= TARGET_STOP_DIST:
                 self.stop_robot()
-                time.sleep(0.5)
-                self.set_state("explore")
-                return
-
-            if self.front_dist < FRONT_STOP_DIST:
-                self.set_state("explore_turn")
+                self.set_state("green_reached")
                 return
 
             self.steer_to_cx(self.green_cx, base_speed=0.10)
             return
 
-        # 5) final blue approach
+        # ---- green → red planned path ----
+
+        # 4b) green reached — pause
+        if self.state == "green_reached":
+            self.stop_robot()
+            if self.state_elapsed() >= GREEN_REACHED_PAUSE:
+                self.green_done = True
+                self.get_logger().info("GREEN CUBE REACHED — marked done")
+                self.set_state("leave_green_turn")
+            return
+
+        # 4c) leave green area — turn
+        if self.state == "leave_green_turn":
+            if self.state_elapsed() < LEAVE_GREEN_TURN_TIME:
+                self.publish_cmd(0.0, LEAVE_GREEN_TURN_SPEED)
+            else:
+                self.set_state("path_to_red_1")
+            return
+
+        # 4d) path to red — forward segment 1
+        if self.state == "path_to_red_1":
+            if self.front_dist < FRONT_STOP_DIST:
+                self.set_state("path_to_red_avoid")
+                return
+            if self.red_visible and self.red_reachable:
+                self.set_state("approach_red")
+                return
+            if self.state_elapsed() < PATH_GR_FWD1_TIME:
+                angular = 0.0
+                if self.left_dist < SIDE_WALL_DIST:
+                    angular = -SOFT_TURN_SPEED
+                elif self.right_dist < SIDE_WALL_DIST:
+                    angular = SOFT_TURN_SPEED
+                self.publish_cmd(PATH_GR_FWD1_SPEED, angular)
+            else:
+                self.set_state("path_to_red_turn")
+            return
+
+        # 4e) path to red — turn toward red zone
+        if self.state == "path_to_red_turn":
+            if self.state_elapsed() < PATH_GR_TURN_TIME:
+                self.publish_cmd(0.0, PATH_GR_TURN_SPEED)
+            else:
+                self.set_state("path_to_red_2")
+            return
+
+        # 4f) path to red — forward segment 2
+        if self.state == "path_to_red_2":
+            if self.front_dist < FRONT_STOP_DIST:
+                self.set_state("path_to_red_avoid")
+                return
+            if self.red_visible and self.red_reachable:
+                self.set_state("approach_red")
+                return
+            if self.state_elapsed() < PATH_GR_FWD2_TIME:
+                angular = 0.0
+                if self.left_dist < SIDE_WALL_DIST:
+                    angular = -SOFT_TURN_SPEED
+                elif self.right_dist < SIDE_WALL_DIST:
+                    angular = SOFT_TURN_SPEED
+                self.publish_cmd(PATH_GR_FWD2_SPEED, angular)
+            else:
+                self.set_state("search_red")
+            return
+
+        # 4g) search for red — slow rotation in place
+        if self.state == "search_red":
+            if self.red_visible and self.red_reachable:
+                self.set_state("approach_red")
+                return
+            if self.state_elapsed() < RED_SEARCH_TIMEOUT:
+                self.publish_cmd(0.0, RED_SEARCH_ROTATE_SPEED)
+            else:
+                self.set_state("explore")
+            return
+
+        # 4h) wall avoidance during path to red
+        if self.state == "path_to_red_avoid":
+            turn_dir = 1.0 if self.left_dist > self.right_dist else -1.0
+            if self.front_dist > FRONT_CLEAR_DIST:
+                self.set_state("search_red")
+            else:
+                self.publish_cmd(0.0, turn_dir * TURN_SPEED)
+            return
+
+        # 4i) approach red cube
+        if self.state == "approach_red":
+            if not (self.red_visible and self.red_reachable):
+                if self.state_elapsed() > 3.0:
+                    self.set_state("search_red")
+                else:
+                    self.stop_robot()
+                return
+
+            if self.front_dist <= TARGET_STOP_DIST:
+                self.stop_robot()
+                self.set_state("red_reached")
+                return
+
+            self.steer_to_cx(self.red_cx, base_speed=0.10)
+            return
+
+        # 4j) red reached — pause
+        if self.state == "red_reached":
+            self.stop_robot()
+            if self.state_elapsed() >= RED_REACHED_PAUSE:
+                self.red_done = True
+                self.get_logger().info("RED CUBE REACHED — marked done")
+                self.set_state("leave_red_turn")
+            return
+
+        # ---- red → blue planned path ----
+
+        # 5a) leave red area — turn toward blue zone
+        if self.state == "leave_red_turn":
+            if self.state_elapsed() < LEAVE_RED_TURN_TIME:
+                self.publish_cmd(0.0, LEAVE_RED_TURN_SPEED)
+            else:
+                self.set_state("path_to_blue_1")
+            return
+
+        # 5b) path to blue — forward segment 1
+        if self.state == "path_to_blue_1":
+            if self.front_dist < FRONT_STOP_DIST:
+                self.set_state("path_to_blue_avoid")
+                return
+            if self.blue_visible and self.blue_reachable:
+                self.set_state("approach_blue")
+                return
+            if self.state_elapsed() < PATH_RB_FWD1_TIME:
+                angular = 0.0
+                if self.left_dist < SIDE_WALL_DIST:
+                    angular = -SOFT_TURN_SPEED
+                elif self.right_dist < SIDE_WALL_DIST:
+                    angular = SOFT_TURN_SPEED
+                self.publish_cmd(PATH_RB_FWD1_SPEED, angular)
+            else:
+                self.set_state("path_to_blue_turn")
+            return
+
+        # 5c) path to blue — corrective turn
+        if self.state == "path_to_blue_turn":
+            if self.state_elapsed() < PATH_RB_TURN_TIME:
+                self.publish_cmd(0.0, PATH_RB_TURN_SPEED)
+            else:
+                self.set_state("path_to_blue_2")
+            return
+
+        # 5d) path to blue — forward segment 2
+        if self.state == "path_to_blue_2":
+            if self.front_dist < FRONT_STOP_DIST:
+                self.set_state("path_to_blue_avoid")
+                return
+            if self.blue_visible and self.blue_reachable:
+                self.set_state("approach_blue")
+                return
+            if self.state_elapsed() < PATH_RB_FWD2_TIME:
+                angular = 0.0
+                if self.left_dist < SIDE_WALL_DIST:
+                    angular = -SOFT_TURN_SPEED
+                elif self.right_dist < SIDE_WALL_DIST:
+                    angular = SOFT_TURN_SPEED
+                self.publish_cmd(PATH_RB_FWD2_SPEED, angular)
+            else:
+                self.set_state("search_blue")
+            return
+
+        # 5e) search for blue — slow rotation in place
+        if self.state == "search_blue":
+            if self.blue_visible and self.blue_reachable:
+                self.set_state("approach_blue")
+                return
+            if self.state_elapsed() < BLUE_SEARCH_TIMEOUT:
+                self.publish_cmd(0.0, BLUE_SEARCH_ROTATE_SPEED)
+            else:
+                self.set_state("explore")
+            return
+
+        # 5f) wall avoidance during path to blue
+        if self.state == "path_to_blue_avoid":
+            turn_dir = 1.0 if self.left_dist > self.right_dist else -1.0
+            if self.front_dist > FRONT_CLEAR_DIST:
+                self.set_state("search_blue")
+            else:
+                self.publish_cmd(0.0, turn_dir * TURN_SPEED)
+            return
+
+        # 6) final blue approach
         if self.state == "approach_blue":
             if not (self.blue_visible and self.blue_reachable):
                 self.set_state("explore")
@@ -336,17 +551,28 @@ class ColourProject(Node):
                 self.set_state("explore_turn")
                 return
 
-            self.steer_to_cx(self.blue_cx, base_speed=0.10)
+            # Steer toward blue, but bias right when left wall is close
+            error_x = self.blue_cx - (self.image_width / 2.0)
+            norm_error = error_x / (self.image_width / 2.0)
+            angular = -0.8 * norm_error
+            if self.left_dist < SIDE_WALL_DIST:
+                angular -= 0.3  # nudge right, away from left wall
+            angular = max(min(angular, 0.8), -0.8)
+            self.publish_cmd(0.15, angular)
             return
 
-        # 6) general explore
+        # 7) general explore
         if self.state == "explore":
-            if self.blue_visible and self.blue_reachable:
+            if self.red_done and self.blue_visible and self.blue_reachable:
                 self.set_state("approach_blue")
                 return
 
-            if self.green_visible and self.green_reachable:
+            if not self.green_done and self.green_visible and self.green_reachable:
                 self.set_state("approach_green")
+                return
+
+            if self.green_done and not self.red_done and self.red_visible and self.red_reachable:
+                self.set_state("approach_red")
                 return
 
             if self.front_dist < FRONT_AVOID_DIST:
